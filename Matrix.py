@@ -7,13 +7,13 @@ import shutil
 # Набір символів, що імітує код з "Матриці"
 LATIN_AND_NUMS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 HALF_WIDTH_KATAKANA = "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍｦｲｸｺｿﾁﾄﾉﾌﾔﾖﾙﾚﾛﾝ"
-KATAKANA = "アァカサタナハマヤャラワガザダバパイィキシチニヒミリヰギジヂビピウゥクスツヌフムユュルグズヅブプエェケセテネヘメレヱゲゼデベペオォコソトノホモヨョロヲゴゾドボポヴッン"
+KATAKANA = "アァカサタナハマヤャラワガザダバパイィキシチニヒミリヰギジヂビピウゥクスツヌフムユュルグズヅブプエェケセテネヘメメレヱゲゼデベペオォコソトノホモヨョロヲゴゾドボポヴッン"
 CHARS = LATIN_AND_NUMS + KATAKANA + HALF_WIDTH_KATAKANA
 
 # ANSI коди кольорів
 COLOR_BRIGHT_WHITE = "\033[97m"
 COLOR_GREEN = "\033[32m"
-COLOR_DARK_GREEN = "\033[90m" # Яскраво-чорний, виглядає як темний
+COLOR_DARK_GREEN = "\033[90m"  # Яскраво-чорний, виглядає як темний
 COLOR_RESET = "\033[0m"
 
 
@@ -53,8 +53,8 @@ def matrix_effect():
 
             # 2. Рух та створення нових крапель
             for x in range(columns):
-                if drops[x]['y'] == -1: # Якщо крапля неактивна
-                    if random.random() > 0.975: # Створюємо нову з певною ймовірністю
+                if drops[x]['y'] == -1:  # Якщо крапля неактивна
+                    if random.random() > 0.975:  # Створюємо нову з певною ймовірністю
                         drops[x]['y'] = 0
                         drops[x]['len'] = random.randint(5, rows - 5)
                 else:
@@ -70,12 +70,12 @@ def matrix_effect():
             # 3. Виводимо кадр на екран
             output = "\033[H" + "\n".join("".join(row) for row in screen)
             print(output, end="")
-            time.sleep(0.15)
+            time.sleep(0.3)
 
     except KeyboardInterrupt:
         # Скидання налаштувань терміналу при виході
-        os.system('cls' if os.name == 'nt' else 'clear') # Очищуємо термінал
-        print(f"\033[?25h{COLOR_RESET}", end="") # Повертаємо курсор і скидаємо колір
+        os.system('cls' if os.name == 'nt' else 'clear')  # Очищуємо термінал
+        print(f"\033[?25h{COLOR_RESET}", end="")  # Повертаємо курсор і скидаємо колір
         print("\nПрограму зупинено.")
 
 
