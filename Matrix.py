@@ -1,83 +1,194 @@
-import random
 import os
-import time
+import random
 import shutil
+import sys
+import time
 
-# --- КОНСТАНТИ ---
-# Набір символів, що імітує код з "Матриці"
-LATIN_AND_NUMS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# --- НАБІР СИМВОЛІВ ---
+# У фільмі використана саме напівширинна катакана: вона моноширинна,
+# тому сітка не "розповзається". Повноширинні (アカサ...) займають
+# 2 стовпці в терміналі й ламають вирівнювання — тому їх не беремо.
 HALF_WIDTH_KATAKANA = "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍｦｲｸｺｿﾁﾄﾉﾌﾔﾖﾙﾚﾛﾝ"
-KATAKANA = "アァカサタナハマヤャラワガザダバパイィキシチニヒミリヰギジヂビピウゥクスツヌフムユュルグズヅブプエェケセテネヘメメレヱゲゼデベペオォコソトノホモヨョロヲゴゾドボポヴッン"
-CHARS = LATIN_AND_NUMS + KATAKANA + HALF_WIDTH_KATAKANA
+DIGITS_AND_SIGNS = "0123456789Z:.=*+-<>¦"
+CHARS = HALF_WIDTH_KATAKANA * 3 + DIGITS_AND_SIGNS
 
-# ANSI коди кольорів
-COLOR_BRIGHT_WHITE = "\033[97m"
-COLOR_GREEN = "\033[32m"
-COLOR_DARK_GREEN = "\033[90m"  # Яскраво-чорний, виглядає як темний
+# --- НАЛАШТУВАННЯ ЕФЕКТУ ---
+FPS = 30                  # кадрів на секунду (плавність картинки)
+DROP_SPEED = (0.16, 0.5)  # клітинок за кадр (різна швидкість = "живий" дощ)
+TRAIL_LEN = (8, 30)       # довжина хвоста в клітинках
+SPAWN_CHANCE = 0.008      # шанс запустити нову краплю в порожньому стовпці
+FLICKER_RATIO = 0.12      # частка ширини екрана, що мерехтить щокадру
+FIXED_SIZE = None         # напр. (120, 40); None — брати розмір терміналу
+
+# --- КОЛЬОРИ (ANSI 256) ---
 COLOR_RESET = "\033[0m"
+HEAD_COLOR = "\033[1;97m"  # яскраво-біла "голова" краплі
+GREEN_RAMP = (
+    "\033[38;5;194m",
+    "\033[38;5;157m",
+    "\033[38;5;120m",
+    "\033[38;5;84m",
+    "\033[38;5;48m",
+    "\033[38;5;41m",
+    "\033[38;5;35m",
+    "\033[38;5;29m",
+    "\033[38;5;23m",
+    "\033[38;5;22m",
+)
+
+# --- КЕРУВАННЯ ТЕРМІНАЛОМ ---
+ENTER_SCREEN = "\033[?1049h\033[?25l\033[?7l\033[2J"  # альт. екран, без курсора, без переносу
+EXIT_SCREEN = "\033[?7h\033[?25h\033[?1049l" + COLOR_RESET
+
+
+def get_size():
+    """Розмір полотна — усе вікно терміналу (або FIXED_SIZE, якщо задано).
+
+    Питаємо розмір напряму в терміналу через ioctl: shutil.get_terminal_size()
+    спершу дивиться на COLUMNS/LINES, а вони в IDE-консолях і в tmux часто
+    застарілі — через це кадр займав лише частину вікна.
+    """
+    if FIXED_SIZE:
+        return FIXED_SIZE
+
+    for stream in (sys.__stdout__, sys.__stderr__, sys.__stdin__):
+        try:
+            size = os.get_terminal_size(stream.fileno())
+        except (OSError, ValueError, AttributeError):
+            continue  # не термінал (перенаправлений вивід) — пробуємо наступний
+        if size.columns > 0 and size.lines > 0:
+            return max(size.columns, 20), max(size.lines, 10)
+
+    # Резерв: змінні оточення, далі — 120x40
+    columns, rows = shutil.get_terminal_size((120, 40))
+    return max(columns, 20), max(rows, 10)
+
+
+def new_drop():
+    """Нова крапля: позиція голови, швидкість, довжина хвоста."""
+    speed = random.uniform(*DROP_SPEED)
+    # Хвіст задаємо в клітинках, а живе він у кадрах: чим повільніша
+    # крапля, тим довше має гаснути слід, щоб довжина не залежала від швидкості
+    return {
+        "y": 0.0,
+        "last": -1,  # останній уже намальований рядок
+        "speed": speed,
+        "life": max(2, round(random.randint(*TRAIL_LEN) / speed)),
+    }
 
 
 def matrix_effect():
-    # # Отримуємо розмір терміналу (автоматично)
-    # columns, rows = shutil.get_terminal_size()
-    # Встановлюємо фіксований розмір (наприклад, 120 стовпців, 40 рядків)
-    columns, rows = 120, 40
+    columns, rows = get_size()
+    # chars — символ у клітинці, age — скільки кадрів він живе,
+    # life — через скільки кадрів згасне остаточно (-1 в age = порожньо)
+    chars = [[" "] * columns for _ in range(rows)]
+    age = [[-1] * columns for _ in range(rows)]
+    life = [[1] * columns for _ in range(rows)]
+    drops = [None] * columns
 
-    # Для кожного стовпця відстежуємо позицію "краплі" та її довжину
-    # -1 означає, що крапля неактивна
-    drops = [{'y': -1, 'len': 0} for _ in range(columns)]
+    frame_time = 1.0 / FPS
+    ramp_last = len(GREEN_RAMP) - 1
+    write = sys.stdout.write
 
-    # Очищуємо термінал перед початком
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-    # Сховати курсор
-    print("\033[?25l", end="")
-    # Створюємо початковий порожній екран
-    screen = [[' ' for _ in range(columns)] for _ in range(rows)]
-
+    write(ENTER_SCREEN)
     try:
         while True:
-            # 1. Згасання існуючих символів
+            frame_start = time.perf_counter()
+
+            # 0. Реакція на зміну розміру вікна
+            if (columns, rows) != get_size():
+                columns, rows = get_size()
+                chars = [[" "] * columns for _ in range(rows)]
+                age = [[-1] * columns for _ in range(rows)]
+                life = [[1] * columns for _ in range(rows)]
+                drops = [None] * columns
+                write("\033[2J")
+
+            # 1. Згасання: кожна клітинка живе стільки кадрів,
+            #    скільки задала довжина хвоста своєї краплі
             for y in range(rows):
+                age_row = age[y]
+                life_row = life[y]
                 for x in range(columns):
-                    if screen[y][x] != ' ':
-                        # Змінюємо колір або робимо пробілом для ефекту згасання
-                        if screen[y][x].startswith(COLOR_BRIGHT_WHITE):
-                            char = screen[y][x][-len(COLOR_RESET)-1]
-                            screen[y][x] = f"{COLOR_GREEN}{char}{COLOR_RESET}"
-                        elif screen[y][x].startswith(COLOR_GREEN):
-                            char = screen[y][x][-len(COLOR_RESET)-1]
-                            screen[y][x] = f"{COLOR_DARK_GREEN}{char}{COLOR_RESET}"
-                        else:
-                            screen[y][x] = ' '
+                    a = age_row[x]
+                    if a >= 0:
+                        a += 1
+                        age_row[x] = a if a <= life_row[x] else -1
 
-            # 2. Рух та створення нових крапель
+            # 2. Рух крапель і поява нових
             for x in range(columns):
-                if drops[x]['y'] == -1:  # Якщо крапля неактивна
-                    if random.random() > 0.975:  # Створюємо нову з певною ймовірністю
-                        drops[x]['y'] = 0
-                        drops[x]['len'] = random.randint(5, rows - 5)
-                else:
-                    y = drops[x]['y']
-                    if y < rows:
-                        screen[y][x] = f"{COLOR_BRIGHT_WHITE}{random.choice(CHARS)}{COLOR_RESET}"
-                    
-                    drops[x]['y'] += 1
-                    # Якщо крапля пройшла свою довжину, робимо її неактивною
-                    if drops[x]['y'] >= drops[x]['len']:
-                        drops[x] = {'y': -1, 'len': 0}
+                drop = drops[x]
+                if drop is None:
+                    if random.random() < SPAWN_CHANCE:
+                        drops[x] = new_drop()
+                    continue
 
-            # 3. Виводимо кадр на екран
-            output = "\033[H" + "\n".join("".join(row) for row in screen)
-            print(output, end="")
-            time.sleep(0.3)
+                drop["y"] += drop["speed"]
+                head = int(drop["y"])
+                # Малюємо всі клітинки, які голова проминула за цей кадр
+                for y in range(drop["last"] + 1, min(head, rows - 1) + 1):
+                    chars[y][x] = random.choice(CHARS)
+                    age[y][x] = 0
+                    life[y][x] = drop["life"]
+                drop["last"] = min(head, rows - 1)
+                # Голова лишається білою, поки не зрушить далі:
+                # при швидкості < 1 вона стоїть на клітинці кілька кадрів
+                age[drop["last"]][x] = 0
+
+                if head >= rows:  # голова пішла за край — хвіст догасне сам
+                    drops[x] = None
+
+            # 3. Мерехтіння: частина видимих символів змінюється на льоту
+            for _ in range(int(columns * FLICKER_RATIO)):
+                fx = random.randrange(columns)
+                fy = random.randrange(rows)
+                if age[fy][fx] > 0:
+                    chars[fy][fx] = random.choice(CHARS)
+
+            # 4. Складаємо кадр одним рядком; колір пишемо лише коли він змінився
+            out = ["\033[H"]
+            append = out.append
+            prev_color = None
+            for y in range(rows):
+                if y:
+                    append("\n")
+                age_row = age[y]
+                life_row = life[y]
+                char_row = chars[y]
+                for x in range(columns):
+                    a = age_row[x]
+                    if a < 0:
+                        append(" ")
+                        continue
+                    if a == 0:
+                        color = HEAD_COLOR
+                    else:
+                        idx = a * ramp_last // life_row[x]
+                        color = GREEN_RAMP[idx if idx < ramp_last else ramp_last]
+                    if color != prev_color:
+                        append(color)
+                        prev_color = color
+                    append(char_row[x])
+            append(COLOR_RESET)
+
+            write("".join(out))
+            sys.stdout.flush()
+
+            # 5. Тримаємо стабільний FPS з поправкою на час рендера
+            delay = frame_time - (time.perf_counter() - frame_start)
+            if delay > 0:
+                time.sleep(delay)
 
     except KeyboardInterrupt:
-        # Скидання налаштувань терміналу при виході
-        os.system('cls' if os.name == 'nt' else 'clear')  # Очищуємо термінал
-        print(f"\033[?25h{COLOR_RESET}", end="")  # Повертаємо курсор і скидаємо колір
-        print("\nПрограму зупинено.")
+        pass
+    finally:
+        # Термінал відновлюємо завжди, навіть якщо впала помилка
+        write(EXIT_SCREEN)
+        sys.stdout.flush()
+        print("Програму зупинено.")
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        os.system("")  # вмикає обробку ANSI-кодів у cmd.exe
     matrix_effect()
