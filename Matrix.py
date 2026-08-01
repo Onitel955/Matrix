@@ -27,6 +27,8 @@ DROPS_PER_SEC = 0.07       # скільки крапель за секунду �
 FLICKER_PER_SEC = 2.0      # скільки символів за секунду змінюється в стовпці
 FIXED_SIZE = None          # напр. (120, 40); None — усе вікно терміналу
 FALLBACK_SIZE = (120, 40)  # якщо вивід не в термінал і розмір невідомий
+MAX_FRAME_SKIP = 3         # більший стрибок часу за кадр вважаємо затримкою
+REDRAW_EVERY = 5.0         # раз на стільки секунд перемальовуємо екран цілком
 
 # --- КОЛЬОРИ ---
 TRAIL_RGB = (0, 255, 70)    # зелений хвіст
@@ -42,7 +44,6 @@ GREEN_256 = (16, 22, 22, 28, 34, 40, 46, 47, 48, 84, 120, 157, 194)
 
 # --- КЕРУВАННЯ ТЕРМІНАЛОМ ---
 RESET = "\033[0m"
-HOME = "\033[H"
 CLEAR = "\033[2J"
 # альтернативний екран, сховати курсор, вимкнути автоперенос рядків
 ENTER_SCREEN = "\033[?1049h\033[?25l\033[?7l" + CLEAR
@@ -130,6 +131,15 @@ class Rain:
         self.glow = [[None] * columns for _ in range(rows)]  # колір голови
         self.drops = [None] * columns
         self.lit = []  # клітинки з головою — щоб згасити їх наступного кадру
+        # Що вже стоїть на екрані — щоб не надсилати незмінне вдруге.
+        self.shown_char = [[" "] * columns for _ in range(rows)]
+        self.shown_color = [[None] * columns for _ in range(rows)]
+
+    def forget_screen(self):
+        """Забути стан екрана — наступний кадр перемалюється повністю."""
+        for row in range(self.rows):
+            self.shown_char[row] = [" "] * self.columns
+            self.shown_color[row] = [None] * self.columns
 
     def update(self, dt):
         self._fade_trails(dt)
@@ -204,29 +214,47 @@ class Rain:
                 self.chars[row][column] = random.choice(CHARS)
 
     def render(self):
-        """Збирає кадр одним рядком: колір дописуємо лише коли він змінився."""
-        frame = [HOME]
+        """Збирає кадр із тих клітинок, що змінилися з попереднього разу.
+
+        За кадр змінює відтінок близько десятої частини засвічених клітинок:
+        яскравість спадає повільніше, ніж крок палітри. Тому перемальовувати
+        весь екран — це десятки кілобайтів на кадр, які термінал не завжди
+        встигає відмалювати. Тут виводимо лише різницю.
+        """
+        frame = []
         append = frame.append
         shade_last = SHADES - 1
-        previous = None
+        color_sent = None  # який колір уже надіслано в термінал
         for row in range(self.rows):
-            if row:
-                append("\n")
             chars_row = self.chars[row]
             bright_row = self.bright[row]
             glow_row = self.glow[row]
+            shown_char_row = self.shown_char[row]
+            shown_color_row = self.shown_color[row]
+            cursor = -1  # де стоїть курсор у цьому рядку; -1 — не в ньому
             for column in range(self.columns):
                 color = glow_row[column]
                 if color is None:
                     level = bright_row[column]
-                    if level <= 0.0:
-                        append(" ")
-                        continue
-                    color = TRAIL_PALETTE[int(level * shade_last)]
-                if color != previous:
+                    if level > 0.0:
+                        color = TRAIL_PALETTE[int(level * shade_last)]
+                char = chars_row[column] if color else " "
+
+                if char == shown_char_row[column] and color == shown_color_row[column]:
+                    continue  # на екрані вже те, що потрібно
+
+                if cursor != column:
+                    append(f"\033[{row + 1};{column + 1}H")
+                    cursor = column
+                if color is not None and color != color_sent:
                     append(color)
-                    previous = color
-                append(chars_row[column])
+                    color_sent = color
+                append(char)
+                shown_char_row[column] = char
+                shown_color_row[column] = color
+                cursor += 1
+        if not frame:
+            return ""
         append(RESET)
         return "".join(frame)
 
@@ -238,21 +266,32 @@ def main():
     rain = Rain(*terminal_size())
     write = sys.stdout.write
     frame_time = 1.0 / FPS
-    clock = time.perf_counter()
+    max_dt = frame_time * MAX_FRAME_SKIP
 
     write(ENTER_SCREEN)
+    sys.stdout.flush()  # хай термінал перемкне екран, перш ніж прийде кадр
+    clock = redrawn = time.perf_counter()
+
     try:
         while True:
             started = time.perf_counter()
-            # Рахуємо справжній час кадру, тому темп не збивається,
-            # якщо система пригальмувала.
-            dt = min(started - clock, 0.25)
+            # Рахуємо справжній час кадру, тому темп не збивається, якщо
+            # система пригальмувала. Стрибок обмежуємо: інакше після
+            # затримки краплі телепортувалися б на кілька рядків.
+            dt = min(started - clock, max_dt)
             clock = started
 
             size = terminal_size()
             if size != (rain.columns, rain.rows):
                 rain.resize(*size)
                 write(CLEAR)
+            elif started - redrawn >= REDRAW_EVERY:
+                # Різницевий вивід не бачить сміття, яке лишив хтось інший
+                # (наприклад повідомлення від системи), тому час до часу
+                # перемальовуємо екран цілком.
+                write(CLEAR)
+                rain.forget_screen()
+                redrawn = started
 
             rain.update(dt)
             write(rain.render())
