@@ -1,8 +1,16 @@
+import contextlib
 import os
 import random
 import shutil
 import sys
 import time
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
 # --- НАБІР СИМВОЛІВ ---
 # У фільмі використана саме напівширинна катакана: вона моноширинна,
@@ -19,6 +27,11 @@ TRAIL_LEN = (10, 34)      # довжина хвоста в клітинках
 SPAWN_CHANCE = 0.0022     # шанс запустити нову краплю в порожньому стовпці
 FLICKER_RATIO = 0.07      # частка ширини екрана, що мерехтить щокадру
 FIXED_SIZE = None         # напр. (120, 40); None — брати розмір терміналу
+
+# --- КЕРУВАННЯ ШВИДКІСТЮ СТРІЛКАМИ ---
+SPEED_MULT_STEP = 1.15    # у скільки разів змінюється швидкість за одне натискання
+SPEED_MULT_MIN = 0.2
+SPEED_MULT_MAX = 5.0
 
 # --- КОЛЬОРИ (ANSI 256) ---
 COLOR_RESET = "\033[0m"
@@ -64,6 +77,55 @@ def get_size():
     return max(columns, 20), max(rows, 10)
 
 
+@contextlib.contextmanager
+def raw_terminal():
+    """Переводить stdin у cbreak-режим, щоб стрілки читались одразу,
+    без Enter і без ехо. Ctrl+C далі працює (ISIG лишається увімкненим).
+    """
+    if os.name == "nt" or not sys.stdin.isatty():
+        yield
+        return
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def poll_speed_keys():
+    """Список подій зі стрілок, що накопичились відколи питали востаннє:
+    +1 — вгору (швидше), -1 — вниз (повільніше)."""
+    events = []
+    if os.name == "nt":
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):
+                arrow = msvcrt.getch()
+                if arrow == b"H":
+                    events.append(1)
+                elif arrow == b"P":
+                    events.append(-1)
+    elif sys.stdin.isatty():
+        fd = sys.stdin.fileno()
+        while select.select([fd], [], [], 0)[0]:
+            chunk = os.read(fd, 1024)
+            if not chunk:  # EOF — стрілок далі не буде
+                break
+            i = 0
+            while i < len(chunk):
+                if chunk[i:i + 3] == b"\x1b[A":
+                    events.append(1)
+                    i += 3
+                elif chunk[i:i + 3] == b"\x1b[B":
+                    events.append(-1)
+                    i += 3
+                else:
+                    i += 1
+    return events
+
+
 def new_drop():
     """Нова крапля: позиція голови, швидкість, довжина хвоста."""
     speed = random.uniform(*DROP_SPEED)
@@ -89,95 +151,108 @@ def matrix_effect():
     frame_time = 1.0 / FPS
     ramp_last = len(GREEN_RAMP) - 1
     write = sys.stdout.write
+    speed_mult = 1.0
 
     write(ENTER_SCREEN)
     try:
-        while True:
-            frame_start = time.perf_counter()
+        with raw_terminal():
+            while True:
+                frame_start = time.perf_counter()
 
-            # 0. Реакція на зміну розміру вікна
-            if (columns, rows) != get_size():
-                columns, rows = get_size()
-                chars = [[" "] * columns for _ in range(rows)]
-                age = [[-1] * columns for _ in range(rows)]
-                life = [[1] * columns for _ in range(rows)]
-                drops = [None] * columns
-                write("\033[2J")
-
-            # 1. Згасання: кожна клітинка живе стільки кадрів,
-            #    скільки задала довжина хвоста своєї краплі
-            for y in range(rows):
-                age_row = age[y]
-                life_row = life[y]
-                for x in range(columns):
-                    a = age_row[x]
-                    if a >= 0:
-                        a += 1
-                        age_row[x] = a if a <= life_row[x] else -1
-
-            # 2. Рух крапель і поява нових
-            for x in range(columns):
-                drop = drops[x]
-                if drop is None:
-                    if random.random() < SPAWN_CHANCE:
-                        drops[x] = new_drop()
-                    continue
-
-                drop["y"] += drop["speed"]
-                head = int(drop["y"])
-                # Малюємо всі клітинки, які голова проминула за цей кадр
-                for y in range(drop["last"] + 1, min(head, rows - 1) + 1):
-                    chars[y][x] = random.choice(CHARS)
-                    age[y][x] = 0
-                    life[y][x] = drop["life"]
-                drop["last"] = min(head, rows - 1)
-                # Голова лишається білою, поки не зрушить далі:
-                # при швидкості < 1 вона стоїть на клітинці кілька кадрів
-                age[drop["last"]][x] = 0
-
-                if head >= rows:  # голова пішла за край — хвіст догасне сам
-                    drops[x] = None
-
-            # 3. Мерехтіння: частина видимих символів змінюється на льоту
-            for _ in range(int(columns * FLICKER_RATIO)):
-                fx = random.randrange(columns)
-                fy = random.randrange(rows)
-                if age[fy][fx] > 0:
-                    chars[fy][fx] = random.choice(CHARS)
-
-            # 4. Складаємо кадр одним рядком; колір пишемо лише коли він змінився
-            out = ["\033[H"]
-            append = out.append
-            prev_color = None
-            for y in range(rows):
-                if y:
-                    append("\n")
-                age_row = age[y]
-                life_row = life[y]
-                char_row = chars[y]
-                for x in range(columns):
-                    a = age_row[x]
-                    if a < 0:
-                        append(" ")
-                        continue
-                    if a == 0:
-                        color = HEAD_COLOR
+                # -1. Стрілки вгору/вниз міняють швидкість падіння
+                for event in poll_speed_keys():
+                    if event > 0:
+                        speed_mult = min(SPEED_MULT_MAX, speed_mult * SPEED_MULT_STEP)
                     else:
-                        idx = a * ramp_last // life_row[x]
-                        color = GREEN_RAMP[idx if idx < ramp_last else ramp_last]
-                    if color != prev_color:
-                        append(color)
-                        prev_color = color
-                    append(char_row[x])
-            append(COLOR_RESET)
+                        speed_mult = max(SPEED_MULT_MIN, speed_mult / SPEED_MULT_STEP)
 
-            write("".join(out))
-            sys.stdout.flush()
+                # 0. Реакція на зміну розміру вікна
+                if (columns, rows) != get_size():
+                    columns, rows = get_size()
+                    chars = [[" "] * columns for _ in range(rows)]
+                    age = [[-1] * columns for _ in range(rows)]
+                    life = [[1] * columns for _ in range(rows)]
+                    drops = [None] * columns
+                    write("\033[2J")
 
-            # 5. Тримаємо стабільний FPS з поправкою на час рендера
-            delay = frame_time - (time.perf_counter() - frame_start)
-            if delay > 0:
-                time.sleep(delay)
+                # 1. Згасання: кожна клітинка живе стільки кадрів,
+                #    скільки задала довжина хвоста своєї краплі
+                for y in range(rows):
+                    age_row = age[y]
+                    life_row = life[y]
+                    for x in range(columns):
+                        a = age_row[x]
+                        if a >= 0:
+                            a += 1
+                            age_row[x] = a if a <= life_row[x] else -1
+
+                # 2. Рух крапель і поява нових
+                for x in range(columns):
+                    drop = drops[x]
+                    if drop is None:
+                        if random.random() < SPAWN_CHANCE:
+                            drops[x] = new_drop()
+                        continue
+
+                    drop["y"] += drop["speed"] * speed_mult
+                    head = int(drop["y"])
+                    # Малюємо всі клітинки, які голова проминула за цей кадр
+                    for y in range(drop["last"] + 1, min(head, rows - 1) + 1):
+                        chars[y][x] = random.choice(CHARS)
+                        age[y][x] = 0
+                        life[y][x] = drop["life"]
+                    drop["last"] = min(head, rows - 1)
+                    # Голова лишається білою, поки не зрушить далі:
+                    # при швидкості < 1 вона стоїть на клітинці кілька кадрів
+                    age[drop["last"]][x] = 0
+
+                    if head >= rows:  # голова пішла за край — хвіст догасне сам
+                        drops[x] = None
+
+                # 3. Мерехтіння: частина видимих символів змінюється на льоту
+                for _ in range(int(columns * FLICKER_RATIO)):
+                    fx = random.randrange(columns)
+                    fy = random.randrange(rows)
+                    if age[fy][fx] > 0:
+                        chars[fy][fx] = random.choice(CHARS)
+
+                # 4. Складаємо кадр одним рядком; колір пишемо лише коли він змінився
+                out = ["\033[H"]
+                append = out.append
+                prev_color = None
+                for y in range(rows):
+                    if y:
+                        append("\n")
+                    age_row = age[y]
+                    life_row = life[y]
+                    char_row = chars[y]
+                    for x in range(columns):
+                        a = age_row[x]
+                        if a < 0:
+                            append(" ")
+                            continue
+                        if a == 0:
+                            color = HEAD_COLOR
+                        else:
+                            idx = a * ramp_last // life_row[x]
+                            color = GREEN_RAMP[idx if idx < ramp_last else ramp_last]
+                        if color != prev_color:
+                            append(color)
+                            prev_color = color
+                        append(char_row[x])
+                append(COLOR_RESET)
+
+                # Індикатор швидкості в лівому верхньому куті (↑/↓ — керування)
+                speed_tag = f" швидкість x{speed_mult:.2f} (↑/↓) "
+                append(f"\033[1;1H\033[100;97m{speed_tag}\033[0m")
+
+                write("".join(out))
+                sys.stdout.flush()
+
+                # 5. Тримаємо стабільний FPS з поправкою на час рендера
+                delay = frame_time - (time.perf_counter() - frame_start)
+                if delay > 0:
+                    time.sleep(delay)
 
     except KeyboardInterrupt:
         pass
